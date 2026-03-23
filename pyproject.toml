@@ -1,0 +1,17 @@
+[project]
+name = "agent-bridge-backend"
+version = "0.1.6"
+description = "Agent-Bridge backend API and orchestration service"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "websockets>=14.0",
+    "sqlalchemy>=2.0.45",
+    "pyjwt>=2.8.0",
+    "bcrypt>=4.0.0",
+]
+
+[tool.uv]
+dev-dependencies = []
