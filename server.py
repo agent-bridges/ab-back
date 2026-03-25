@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 import jwt
@@ -97,24 +98,6 @@ class ProjectLabel(Base):
     agent_id = Column(Integer, primary_key=True)
     project_hash = Column(String(200), primary_key=True)
     label = Column(String(200), nullable=False, default="")
-
-
-class CanvasItem(Base):
-    __tablename__ = "canvas_items"
-
-    id = Column(String(100), primary_key=True)
-    type = Column(String(20), nullable=False)  # terminal, filebrowser, notes
-    x = Column(Integer, default=0)
-    y = Column(Integer, default=0)
-    label = Column(String(200), default="")
-    pty_id = Column(String(100), nullable=True)
-    agent_id = Column(String(100), nullable=True)
-    note_content = Column(Text, nullable=True)
-    current_path = Column(String(500), nullable=True)
-    # Window state stored as JSON
-    window_state = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 Base.metadata.create_all(engine)
@@ -1264,143 +1247,116 @@ async def get_session_content(project_hash: str, session_id: str):
     return {"messages": messages, "compacted": not has_user_message}
 
 
-# === Canvas Items API ===
+# === Canvas / Board Proxy API ===
 
-CANVAS_LAYOUT_SETTING_PREFIX = "canvas_layout_snapshot"
-
-
-def get_canvas_layout_setting_key(layout_name: str, agent_id: str | None) -> str:
-    scope = agent_id or "__global__"
-    return f"{CANVAS_LAYOUT_SETTING_PREFIX}:{scope}:{layout_name}"
-
-
-def get_canvas_layout_scope_prefix(agent_id: str | None) -> str:
-    scope = agent_id or "__global__"
-    return f"{CANVAS_LAYOUT_SETTING_PREFIX}:{scope}:"
-
-
-def parse_canvas_layout_record(setting: Setting, expected_prefix: str) -> dict | None:
-    if not setting.key.startswith(expected_prefix):
+def parse_canvas_agent_id(agent_id: str | None) -> int | None:
+    if agent_id is None or agent_id == "":
         return None
-
-    layout_name = setting.key[len(expected_prefix):]
-    if not layout_name:
-        return None
-
     try:
-        payload = json.loads(setting.value) if setting.value else {}
-    except json.JSONDecodeError:
-        return None
-
-    snapshot = payload.get("snapshot")
-    saved_at = payload.get("savedAt")
-    if not isinstance(snapshot, dict):
-        return None
-
-    return {
-        "name": payload.get("name") or layout_name,
-        "agentId": payload.get("agentId"),
-        "savedAt": saved_at,
-        "snapshot": snapshot,
-    }
+        return int(agent_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid agent id") from exc
 
 
-def list_canvas_layout_records(db, agent_id: str | None) -> list[dict]:
-    prefix = get_canvas_layout_scope_prefix(agent_id)
-    settings = db.query(Setting).filter(Setting.key.like(f"{prefix}%")).all()
-    layouts: list[dict] = []
-    for setting in settings:
-        parsed = parse_canvas_layout_record(setting, prefix)
-        if parsed:
-            layouts.append(parsed)
-    layouts.sort(key=lambda item: item.get("savedAt") or "", reverse=True)
-    return layouts
+async def get_canvas_proxy_target(agent_id: str | None) -> tuple[str | None, str | None, str | None, int | None]:
+    agent_id_int = parse_canvas_agent_id(agent_id)
+    if agent_id_int is None:
+        return None, None, None, None
+
+    if not await has_agent_canvas_access(agent_id_int):
+        return None, None, None, agent_id_int
+
+    pty_url, _, jwt = get_agent_pty_urls(agent_id_int)
+    if not pty_url or not jwt:
+        return None, None, None, agent_id_int
+
+    return pty_url, jwt, agent_id, agent_id_int
 
 
-def get_canvas_layout_record(db, layout_name: str, agent_id: str | None) -> dict | None:
-    key = get_canvas_layout_setting_key(layout_name, agent_id)
-    setting = get_setting_row(db, key)
-    if not setting:
-        return None
-    return parse_canvas_layout_record(setting, get_canvas_layout_scope_prefix(agent_id))
+def normalize_canvas_board_items(items: list[dict], agent_id: str | None) -> list[dict]:
+    normalized: list[dict] = []
+    for item in items:
+        normalized.append({
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "x": item.get("x", 0),
+            "y": item.get("y", 0),
+            "label": item.get("label", ""),
+            "ptyId": item.get("ptyId"),
+            "agentId": agent_id,
+            "noteContent": item.get("noteContent"),
+            "currentPath": item.get("currentPath"),
+            "window": item.get("window"),
+        })
+    return normalized
 
 
-def save_canvas_layout_record(db, layout_name: str, agent_id: str | None, snapshot: dict) -> dict:
-    stored = {
-        "name": layout_name,
-        "agentId": agent_id,
-        "savedAt": datetime.utcnow().isoformat() + "Z",
-        "snapshot": snapshot,
-    }
-    key = get_canvas_layout_setting_key(layout_name, agent_id)
-    upsert_setting(db, key, json.dumps(stored))
-    return stored
+def normalize_canvas_layout_summary(layouts: list[dict], agent_id: str | None) -> list[dict]:
+    normalized: list[dict] = []
+    for layout in layouts:
+        normalized.append({
+            "name": layout.get("name"),
+            "agentId": agent_id,
+            "savedAt": layout.get("savedAt"),
+            "snapshot": layout.get("snapshot"),
+        })
+    return normalized
 
-
-def delete_canvas_layout_record(db, layout_name: str, agent_id: str | None) -> bool:
-    key = get_canvas_layout_setting_key(layout_name, agent_id)
-    deleted = db.query(Setting).filter(Setting.key == key).delete()
-    return deleted > 0
 
 @app.get("/api/canvas")
 async def list_canvas_items(agent_id: str | None = None):
-    if agent_id is None:
+    pty_url, jwt, scoped_agent_id, _ = await get_canvas_proxy_target(agent_id)
+    if not pty_url or not jwt:
         return []
 
     try:
-        agent_id_int = int(agent_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid agent id")
-
-    if not await has_agent_canvas_access(agent_id_int):
-        return []
-
-    db = SessionLocal()
-    try:
-        query = db.query(CanvasItem).filter(
-            CanvasItem.agent_id == agent_id,
-            CanvasItem.type != "terminal",
-        )
-        items = query.all()
-        return [
-            {
-                "id": i.id,
-                "type": i.type,
-                "x": i.x,
-                "y": i.y,
-                "label": i.label,
-                "ptyId": i.pty_id,
-                "agentId": i.agent_id,
-                "noteContent": i.note_content,
-                "currentPath": i.current_path,
-                "window": json.loads(i.window_state) if i.window_state else None,
-            }
-            for i in items
-        ]
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{pty_url}/api/board/items", headers=get_auth_headers(jwt), timeout=5.0)
+            if resp.status_code != 200:
+                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            items = resp.json()
+            return normalize_canvas_board_items(items, scoped_agent_id)
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.get("/api/canvas/layouts")
 async def list_canvas_layouts(agent_id: str | None = None):
-    db = SessionLocal()
+    pty_url, jwt, scoped_agent_id, _ = await get_canvas_proxy_target(agent_id)
+    if not pty_url or not jwt:
+        return []
+
     try:
-        layouts = list_canvas_layout_records(db, agent_id)
-        return layouts
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{pty_url}/api/board/layouts", headers=get_auth_headers(jwt), timeout=5.0)
+            if resp.status_code != 200:
+                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            layouts = resp.json()
+            return normalize_canvas_layout_summary(layouts, scoped_agent_id)
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.get("/api/canvas/layouts/{layout_name}")
 async def get_canvas_layout(layout_name: str, agent_id: str | None = None):
-    db = SessionLocal()
+    pty_url, jwt, scoped_agent_id, _ = await get_canvas_proxy_target(agent_id)
+    if not pty_url or not jwt:
+        raise HTTPException(status_code=404, detail="Layout not found")
+
     try:
-        parsed = get_canvas_layout_record(db, layout_name, agent_id)
-        if not parsed:
-            raise HTTPException(status_code=404, detail="Layout not found")
-        return parsed
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{pty_url}/api/board/layouts/{quote(layout_name, safe='')}",
+                headers=get_auth_headers(jwt),
+                timeout=5.0,
+            )
+            if resp.status_code != 200:
+                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            layout = resp.json()
+            layout["agentId"] = scoped_agent_id
+            return layout
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.put("/api/canvas/layouts/{layout_name}")
@@ -1414,102 +1370,93 @@ async def put_canvas_layout(layout_name: str, request: Request):
     if not isinstance(snapshot, dict):
         raise HTTPException(status_code=400, detail="snapshot must be an object")
 
-    db = SessionLocal()
+    pty_url, jwt, _, _ = await get_canvas_proxy_target(agent_id)
+    if not pty_url or not jwt:
+        return {"ok": False, "skipped": True}
+
     try:
-        stored = save_canvas_layout_record(db, layout_name, agent_id, snapshot)
-        db.commit()
-        return {"ok": True, "name": layout_name, "savedAt": stored["savedAt"]}
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{pty_url}/api/board/layouts/{quote(layout_name, safe='')}",
+                json={"snapshot": snapshot},
+                headers=get_auth_headers(jwt),
+                timeout=10.0,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.delete("/api/canvas/layouts/{layout_name}")
 async def delete_canvas_layout(layout_name: str, agent_id: str | None = None):
-    db = SessionLocal()
+    pty_url, jwt, _, _ = await get_canvas_proxy_target(agent_id)
+    if not pty_url or not jwt:
+        return {"ok": False, "skipped": True}
+
     try:
-        deleted = delete_canvas_layout_record(db, layout_name, agent_id)
-        db.commit()
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Layout not found")
-        return {"ok": True}
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{pty_url}/api/board/layouts/{quote(layout_name, safe='')}",
+                headers=get_auth_headers(jwt),
+                timeout=5.0,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.put("/api/canvas/{item_id}")
 async def upsert_canvas_item(item_id: str, request: Request):
     data = await request.json()
-    agent_id = data.get("agentId")
-    item_type = data.get("type")
-
-    if item_type == "terminal":
+    if data.get("type") == "terminal":
         return {"ok": True, "skipped": True}
 
-    if not agent_id:
+    pty_url, jwt, _, _ = await get_canvas_proxy_target(data.get("agentId"))
+    if not pty_url or not jwt:
         return {"ok": False, "skipped": True}
 
+    payload = {
+        "type": data.get("type"),
+        "label": data.get("label", ""),
+        "ptyId": data.get("ptyId"),
+        "noteContent": data.get("noteContent"),
+        "currentPath": data.get("currentPath"),
+    }
+
     try:
-        agent_id_int = int(agent_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid agent id")
-
-    if not await has_agent_canvas_access(agent_id_int):
-        return {"ok": False, "skipped": True}
-
-    db = SessionLocal()
-    try:
-        item = db.query(CanvasItem).filter(CanvasItem.id == item_id).first()
-        if not item:
-            item = CanvasItem(id=item_id)
-            db.add(item)
-
-        if "type" in data: item.type = data["type"]
-        if "x" in data: item.x = data["x"]
-        if "y" in data: item.y = data["y"]
-        if "label" in data: item.label = data["label"]
-        if "ptyId" in data: item.pty_id = data["ptyId"]
-        if "agentId" in data: item.agent_id = data["agentId"]
-        if "noteContent" in data: item.note_content = data["noteContent"]
-        if "currentPath" in data: item.current_path = data["currentPath"]
-        if "window" in data:
-            item.window_state = json.dumps(data["window"]) if data["window"] else None
-
-        item.updated_at = datetime.utcnow()
-        db.commit()
-        return {"ok": True}
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{pty_url}/api/board/items/{quote(item_id, safe='')}",
+                json=payload,
+                headers=get_auth_headers(jwt),
+                timeout=10.0,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.delete("/api/canvas/{item_id}")
 async def delete_canvas_item(item_id: str, agent_id: str | None = None):
-    if not agent_id:
+    pty_url, jwt, _, _ = await get_canvas_proxy_target(agent_id)
+    if not pty_url or not jwt:
         return {"ok": False, "skipped": True}
 
     try:
-        agent_id_int = int(agent_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid agent id")
-
-    if not await has_agent_canvas_access(agent_id_int):
-        return {"ok": False, "skipped": True}
-
-    db = SessionLocal()
-    try:
-        db.query(CanvasItem).filter(
-            CanvasItem.id == item_id,
-            CanvasItem.agent_id == agent_id,
-            CanvasItem.type != "terminal",
-        ).delete()
-        db.commit()
-        return {"ok": True}
-    finally:
-        db.close()
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(
+                f"{pty_url}/api/board/items/{quote(item_id, safe='')}",
+                headers=get_auth_headers(jwt),
+                timeout=5.0,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 @app.post("/api/canvas/sync")
 async def sync_canvas_items(request: Request):
-    """Bulk sync non-terminal canvas items for one agent."""
+    """Bulk sync non-terminal canvas items to the selected agent daemon."""
     data = await request.json()
     items = data if isinstance(data, list) else data.get("items", [])
     scoped_agent_id = None if isinstance(data, list) else data.get("agentId")
@@ -1517,40 +1464,36 @@ async def sync_canvas_items(request: Request):
     if not scoped_agent_id:
         return {"ok": False, "skipped": True, "count": 0}
 
-    try:
-        agent_id_int = int(scoped_agent_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid agent id")
-
-    if not await has_agent_canvas_access(agent_id_int):
+    pty_url, jwt, _, _ = await get_canvas_proxy_target(scoped_agent_id)
+    if not pty_url or not jwt:
         return {"ok": False, "skipped": True, "count": 0}
 
-    db = SessionLocal()
+    payload = {
+        "items": [
+            {
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "label": item.get("label", ""),
+                "ptyId": item.get("ptyId"),
+                "noteContent": item.get("noteContent"),
+                "currentPath": item.get("currentPath"),
+            }
+            for item in items
+            if item.get("type") != "terminal"
+        ]
+    }
+
     try:
-        db.query(CanvasItem).filter(
-            CanvasItem.agent_id == scoped_agent_id,
-            CanvasItem.type != "terminal",
-        ).delete()
-        for d in items:
-            if d.get("type") == "terminal":
-                continue
-            item = CanvasItem(
-                id=d["id"],
-                type=d["type"],
-                x=d.get("x", 0),
-                y=d.get("y", 0),
-                label=d.get("label", ""),
-                pty_id=d.get("ptyId"),
-                agent_id=d.get("agentId") or scoped_agent_id,
-                note_content=d.get("noteContent"),
-                current_path=d.get("currentPath"),
-                window_state=json.dumps(d["window"]) if d.get("window") else None,
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{pty_url}/api/board/items/sync",
+                json=payload,
+                headers=get_auth_headers(jwt),
+                timeout=10.0,
             )
-            db.add(item)
-        db.commit()
-        return {"ok": True, "count": len(items)}
-    finally:
-        db.close()
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
 # === Agent-based PTY API ===
