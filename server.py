@@ -474,7 +474,7 @@ async def has_agent_canvas_access(agent_id: int) -> bool:
         return False
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with create_outbound_http_client(timeout=5.0) as client:
             health = await client.get(f"{pty_url}/health")
             if health.status_code != 200:
                 return False
@@ -507,6 +507,39 @@ def get_auth_headers(jwt_secret: str) -> dict:
         )
         return {"Authorization": f"Bearer {token}"}
     return {}
+
+
+def get_optional_existing_path(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    path = Path(value)
+    if not path.exists():
+        raise RuntimeError(f"Configured path does not exist for {name}: {path}")
+    return str(path)
+
+
+def get_outbound_httpx_kwargs(timeout: float | httpx.Timeout | None = None) -> dict:
+    kwargs: dict = {}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+
+    ca_path = get_optional_existing_path("AB_BACK_PTY_TLS_CA_PATH")
+    if ca_path:
+        kwargs["verify"] = ca_path
+
+    client_cert_path = get_optional_existing_path("AB_BACK_PTY_TLS_CLIENT_CERT_PATH")
+    client_key_path = get_optional_existing_path("AB_BACK_PTY_TLS_CLIENT_KEY_PATH")
+    if client_cert_path or client_key_path:
+        if not client_cert_path or not client_key_path:
+            raise RuntimeError("AB_BACK_PTY_TLS_CLIENT_CERT_PATH and AB_BACK_PTY_TLS_CLIENT_KEY_PATH must be set together")
+        kwargs["cert"] = (client_cert_path, client_key_path)
+
+    return kwargs
+
+
+def create_outbound_http_client(timeout: float | httpx.Timeout | None = None) -> httpx.AsyncClient:
+    return httpx.AsyncClient(**get_outbound_httpx_kwargs(timeout))
 
 # Claude projects directory
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -545,7 +578,7 @@ def get_project_hash(path: str) -> str:
 async def get_live_ptys() -> list[str]:
     """Get list of live PTY session IDs from ab-pty"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{DEFAULT_PTY_SERVER}/api/pty", timeout=2.0)
             if resp.status_code == 200:
                 return [s["id"] for s in resp.json() if s.get("alive")]
@@ -557,7 +590,7 @@ async def get_live_ptys() -> list[str]:
 async def get_live_ptys_by_path() -> dict[str, list[dict]]:
     """Get mapping of project_path -> [{pty_id, claude_session_id}]"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{DEFAULT_PTY_SERVER}/api/pty", timeout=2.0)
             if resp.status_code == 200:
                 result = {}
@@ -871,7 +904,7 @@ async def list_agents():
 
         async def fetch_pty_info(agent_data):
             try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
+                async with create_outbound_http_client(timeout=2.0) as client:
                     resp = await client.get(agent_data["_pty_url"])
                     if resp.status_code == 200:
                         agent_data["pty_info"] = resp.json()
@@ -912,7 +945,7 @@ async def get_agent(agent_id: int):
             else:
                 ip = agent.ip if ":" in agent.ip else f"{agent.ip}:8421"
                 pty_url = f"http://{ip}/info"
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with create_outbound_http_client(timeout=3.0) as client:
                 resp = await client.get(pty_url)
                 if resp.status_code == 200:
                     result["pty_info"] = resp.json()
@@ -930,7 +963,7 @@ async def check_agent_reachable(ip: str, port: int = 8421, jwt: str = None):
     import httpx
 
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with create_outbound_http_client(timeout=5.0) as client:
             # First check if daemon is reachable
             res = await client.get(f"http://{ip}:{port}/health")
             if res.status_code != 200:
@@ -957,7 +990,7 @@ async def check_agent_reachable(ip: str, port: int = 8421, jwt: str = None):
 async def verify_pty_daemon_access(ip: str, port: int, jwt: str) -> tuple[bool, str]:
     """Verify that a PTY daemon is reachable and accepts the provided JWT."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with create_outbound_http_client(timeout=5.0) as client:
             res = await client.get(f"http://{ip}:{port}/health")
             if res.status_code != 200:
                 return False, f"Daemon status {res.status_code}"
@@ -1051,7 +1084,7 @@ async def list_locked_processes():
         agents = db.query(Agent).all()
 
         locked_procs = []
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             for agent in agents:
                 pty_url, _, jwt = get_agent_pty_urls(agent.id)
                 if not pty_url:
@@ -1310,7 +1343,7 @@ async def list_canvas_items(agent_id: str | None = None):
         return []
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/board/items", headers=get_auth_headers(jwt), timeout=5.0)
             if resp.status_code != 200:
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -1327,7 +1360,7 @@ async def list_canvas_layouts(agent_id: str | None = None):
         return []
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/board/layouts", headers=get_auth_headers(jwt), timeout=5.0)
             if resp.status_code != 200:
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -1344,7 +1377,7 @@ async def get_canvas_layout(layout_name: str, agent_id: str | None = None):
         raise HTTPException(status_code=404, detail="Layout not found")
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(
                 f"{pty_url}/api/board/layouts/{quote(layout_name, safe='')}",
                 headers=get_auth_headers(jwt),
@@ -1375,7 +1408,7 @@ async def put_canvas_layout(layout_name: str, request: Request):
         return {"ok": False, "skipped": True}
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.put(
                 f"{pty_url}/api/board/layouts/{quote(layout_name, safe='')}",
                 json={"snapshot": snapshot},
@@ -1394,7 +1427,7 @@ async def delete_canvas_layout(layout_name: str, agent_id: str | None = None):
         return {"ok": False, "skipped": True}
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(
                 f"{pty_url}/api/board/layouts/{quote(layout_name, safe='')}",
                 headers=get_auth_headers(jwt),
@@ -1424,7 +1457,7 @@ async def upsert_canvas_item(item_id: str, request: Request):
     }
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.put(
                 f"{pty_url}/api/board/items/{quote(item_id, safe='')}",
                 json=payload,
@@ -1443,7 +1476,7 @@ async def delete_canvas_item(item_id: str, agent_id: str | None = None):
         return {"ok": False, "skipped": True}
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(
                 f"{pty_url}/api/board/items/{quote(item_id, safe='')}",
                 headers=get_auth_headers(jwt),
@@ -1484,7 +1517,7 @@ async def sync_canvas_items(request: Request):
     }
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(
                 f"{pty_url}/api/board/items/sync",
                 json=payload,
@@ -1506,7 +1539,7 @@ async def restore_locked_processes(agent_id: int, pty_url: str, jwt: str | None,
         if not locked:
             return
 
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             for proc in locked:
                 if proc.pty_id in live_pty_ids:
                     continue  # Already alive
@@ -1546,7 +1579,7 @@ async def agent_list_pty(agent_id: int):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/pty", headers=get_auth_headers(jwt), timeout=5.0)
             if resp.status_code == 200:
                 sessions = resp.json()
@@ -1572,7 +1605,7 @@ async def agent_create_pty(agent_id: int, request: Request):
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(f"{pty_url}/api/pty", json=body, headers=get_auth_headers(jwt), timeout=10.0)
 
             # If daemon returned a generic 5xx, enrich with actionable diagnostics.
@@ -1607,7 +1640,7 @@ async def agent_kill_pty(agent_id: int, session_id: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(f"{pty_url}/api/pty/{session_id}", headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1622,7 +1655,7 @@ async def agent_lock_pty(agent_id: int, session_id: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(f"{pty_url}/api/pty/{session_id}/lock", headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1637,7 +1670,7 @@ async def agent_unlock_pty(agent_id: int, session_id: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(f"{pty_url}/api/pty/{session_id}/lock", headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1653,7 +1686,7 @@ async def agent_update_pty_meta(agent_id: int, session_id: str, request: Request
 
     try:
         body = await request.json()
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.patch(f"{pty_url}/api/pty/{session_id}/meta", json=body, headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1670,7 +1703,7 @@ async def agent_list_projects(agent_id: int):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/projects", headers=get_auth_headers(jwt), timeout=5.0)
             if resp.status_code != 200:
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -1712,7 +1745,7 @@ async def agent_get_project(agent_id: int, project_hash: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/projects/{project_hash}", headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1727,7 +1760,7 @@ async def agent_get_project_sessions(agent_id: int, project_hash: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/projects/{project_hash}/sessions", headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1742,7 +1775,7 @@ async def agent_delete_session(agent_id: int, project_hash: str, session_id: str
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(f"{pty_url}/api/sessions/{project_hash}/{session_id}", headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1762,7 +1795,7 @@ async def agent_mkdir(agent_id: int, request: Request):
         if not path or ".." in path:
             return JSONResponse({"error": "Invalid path"}, status_code=400)
 
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(f"{pty_url}/api/mkdir", json={"path": path}, headers=get_auth_headers(jwt), timeout=10.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1777,7 +1810,7 @@ async def agent_delete_project(agent_id: int, project_hash: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(f"{pty_url}/api/projects/{project_hash}", headers=get_auth_headers(jwt), timeout=10.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1795,7 +1828,7 @@ async def agent_browse_filesystem(agent_id: int, path: str = "~", content: str =
         params = {"path": path}
         if content.lower() == "true":
             params["content"] = "true"
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/fs", params=params, headers=get_auth_headers(jwt), timeout=10.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1811,7 +1844,7 @@ async def agent_create_fs(agent_id: int, request: Request):
 
     try:
         body = await request.json()
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(f"{pty_url}/api/fs", json=body, headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1827,7 +1860,7 @@ async def agent_write_fs(agent_id: int, request: Request):
 
     try:
         body = await request.json()
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.put(f"{pty_url}/api/fs", json=body, headers=get_auth_headers(jwt), timeout=10.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1842,7 +1875,7 @@ async def agent_delete_fs(agent_id: int, path: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.delete(f"{pty_url}/api/fs", params={"path": path}, headers=get_auth_headers(jwt), timeout=5.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1857,7 +1890,7 @@ async def agent_download_file(agent_id: int, path: str):
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/fs/download", params={"path": path}, headers=get_auth_headers(jwt), timeout=30.0)
             if resp.status_code != 200:
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -1886,7 +1919,7 @@ async def agent_upload_file(agent_id: int, request: Request):
         # Forward multipart body as-is
         body = await request.body()
         content_type = request.headers.get("content-type", "")
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(
                 f"{pty_url}/api/fs/upload",
                 content=body,
@@ -1906,7 +1939,7 @@ async def agent_get_session_content(agent_id: int, project_hash: str, session_id
         return JSONResponse({"error": "Agent not found"}, status_code=404)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.get(f"{pty_url}/api/sessions/{project_hash}/{session_id}/content", headers=get_auth_headers(jwt), timeout=10.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
@@ -1922,7 +1955,7 @@ async def agent_paste_image(agent_id: int, request: Request):
 
     try:
         body = await request.json()
-        async with httpx.AsyncClient() as client:
+        async with create_outbound_http_client() as client:
             resp = await client.post(f"{pty_url}/api/paste-image", json=body, headers=get_auth_headers(jwt), timeout=30.0)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
     except Exception as e:
