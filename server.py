@@ -11,6 +11,7 @@ from http.cookies import SimpleCookie
 import json
 import os
 import secrets
+import ssl
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -525,15 +526,22 @@ def get_outbound_httpx_kwargs(timeout: float | httpx.Timeout | None = None) -> d
         kwargs["timeout"] = timeout
 
     ca_path = get_optional_existing_path("AB_BACK_PTY_TLS_CA_PATH")
-    if ca_path:
-        kwargs["verify"] = ca_path
-
     client_cert_path = get_optional_existing_path("AB_BACK_PTY_TLS_CLIENT_CERT_PATH")
     client_key_path = get_optional_existing_path("AB_BACK_PTY_TLS_CLIENT_KEY_PATH")
+
     if client_cert_path or client_key_path:
         if not client_cert_path or not client_key_path:
             raise RuntimeError("AB_BACK_PTY_TLS_CLIENT_CERT_PATH and AB_BACK_PTY_TLS_CLIENT_KEY_PATH must be set together")
-        kwargs["cert"] = (client_cert_path, client_key_path)
+
+    if ca_path or client_cert_path:
+        ssl_context = ssl.create_default_context(cafile=ca_path) if ca_path else ssl.create_default_context()
+        if client_cert_path and client_key_path:
+            ssl_context.load_cert_chain(client_cert_path, client_key_path)
+        kwargs["verify"] = ssl_context
+        return kwargs
+
+    if ca_path:
+        kwargs["verify"] = ca_path
 
     return kwargs
 
@@ -892,6 +900,7 @@ async def list_agents():
         agents = db.query(Agent).all()
         agent_list = []
         for a in agents:
+            pty_url, _, _ = get_agent_pty_urls(a.id)
             agent_list.append({
                 "id": str(a.id),
                 "name": a.name,
@@ -899,10 +908,12 @@ async def list_agents():
                 "is_local": a.is_local,
                 "created_at": a.created_at.isoformat() if a.created_at else None,
                 "pty_info": None,
-                "_pty_url": f"{DEFAULT_PTY_SERVER}/info" if a.is_local else f"http://{a.ip if ':' in (a.ip or '') else f'{a.ip}:8421'}/info",
+                "_pty_url": f"{pty_url}/info" if pty_url else None,
             })
 
         async def fetch_pty_info(agent_data):
+            if not agent_data.get("_pty_url"):
+                return
             try:
                 async with create_outbound_http_client(timeout=2.0) as client:
                     resp = await client.get(agent_data["_pty_url"])
@@ -938,15 +949,11 @@ async def get_agent(agent_id: int):
             "pty_info": None,
         }
 
-        # Fetch PTY info (use DEFAULT_PTY_SERVER for local agent)
+        # Fetch PTY info from the normalized agent PTY URL.
         try:
-            if agent.is_local:
-                pty_url = f"{DEFAULT_PTY_SERVER}/info"
-            else:
-                ip = agent.ip if ":" in agent.ip else f"{agent.ip}:8421"
-                pty_url = f"http://{ip}/info"
+            pty_url, _, _ = get_agent_pty_urls(agent.id)
             async with create_outbound_http_client(timeout=3.0) as client:
-                resp = await client.get(pty_url)
+                resp = await client.get(f"{pty_url}/info")
                 if resp.status_code == 200:
                     result["pty_info"] = resp.json()
         except:
