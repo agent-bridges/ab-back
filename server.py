@@ -549,6 +549,29 @@ def get_outbound_httpx_kwargs(timeout: float | httpx.Timeout | None = None) -> d
 def create_outbound_http_client(timeout: float | httpx.Timeout | None = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(**get_outbound_httpx_kwargs(timeout))
 
+
+def get_outbound_websocket_kwargs(ws_url: str | None = None) -> dict:
+    kwargs: dict = {}
+
+    if ws_url and not ws_url.startswith("wss://"):
+        return kwargs
+
+    ca_path = get_optional_existing_path("AB_BACK_PTY_TLS_CA_PATH")
+    client_cert_path = get_optional_existing_path("AB_BACK_PTY_TLS_CLIENT_CERT_PATH")
+    client_key_path = get_optional_existing_path("AB_BACK_PTY_TLS_CLIENT_KEY_PATH")
+
+    if client_cert_path or client_key_path:
+        if not client_cert_path or not client_key_path:
+            raise RuntimeError("AB_BACK_PTY_TLS_CLIENT_CERT_PATH and AB_BACK_PTY_TLS_CLIENT_KEY_PATH must be set together")
+
+    if ca_path or client_cert_path:
+        ssl_context = ssl.create_default_context(cafile=ca_path) if ca_path else ssl.create_default_context()
+        if client_cert_path and client_key_path:
+            ssl_context.load_cert_chain(client_cert_path, client_key_path)
+        kwargs["ssl"] = ssl_context
+
+    return kwargs
+
 # Claude projects directory
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
@@ -1448,8 +1471,6 @@ async def delete_canvas_layout(layout_name: str, agent_id: str | None = None):
 @app.put("/api/canvas/{item_id}")
 async def upsert_canvas_item(item_id: str, request: Request):
     data = await request.json()
-    if data.get("type") == "terminal":
-        return {"ok": True, "skipped": True}
 
     pty_url, jwt, _, _ = await get_canvas_proxy_target(data.get("agentId"))
     if not pty_url or not jwt:
@@ -1457,6 +1478,8 @@ async def upsert_canvas_item(item_id: str, request: Request):
 
     payload = {
         "type": data.get("type"),
+        "x": data.get("x", 0),
+        "y": data.get("y", 0),
         "label": data.get("label", ""),
         "ptyId": data.get("ptyId"),
         "noteContent": data.get("noteContent"),
@@ -1513,13 +1536,14 @@ async def sync_canvas_items(request: Request):
             {
                 "id": item.get("id"),
                 "type": item.get("type"),
+                "x": item.get("x", 0),
+                "y": item.get("y", 0),
                 "label": item.get("label", ""),
                 "ptyId": item.get("ptyId"),
                 "noteContent": item.get("noteContent"),
                 "currentPath": item.get("currentPath"),
             }
             for item in items
-            if item.get("type") != "terminal"
         ]
     }
 
@@ -1992,6 +2016,7 @@ async def agent_websocket_proxy(client_ws: WebSocket, agent_id: int):
             ws_url,
             max_size=50 * 1024 * 1024,
             additional_headers=headers if headers else None,
+            **get_outbound_websocket_kwargs(ws_url),
         )
 
         async def client_to_pty():
@@ -2065,6 +2090,7 @@ async def agent_pty_state_proxy(client_ws: WebSocket, agent_id: int):
         pty_ws = await websockets.connect(
             ws_url,
             additional_headers=headers if headers else None,
+            **get_outbound_websocket_kwargs(ws_url),
         )
 
         async def client_to_pty():
