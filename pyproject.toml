@@ -1,6 +1,6 @@
 [project]
 name = "agent-bridge-backend"
-version = "0.1.9"
+version = "0.1.10"
 description = "Agent-Bridge backend API and orchestration service"
 requires-python = ">=3.11"
 dependencies = [

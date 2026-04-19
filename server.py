@@ -540,8 +540,8 @@ def get_outbound_httpx_kwargs(timeout: float | httpx.Timeout | None = None) -> d
         kwargs["verify"] = ssl_context
         return kwargs
 
-    if ca_path:
-        kwargs["verify"] = ca_path
+    # No CA configured — allow self-signed certs for HTTPS PTY connections
+    kwargs["verify"] = False
 
     return kwargs
 
@@ -568,6 +568,12 @@ def get_outbound_websocket_kwargs(ws_url: str | None = None) -> dict:
         ssl_context = ssl.create_default_context(cafile=ca_path) if ca_path else ssl.create_default_context()
         if client_cert_path and client_key_path:
             ssl_context.load_cert_chain(client_cert_path, client_key_path)
+        kwargs["ssl"] = ssl_context
+    elif ws_url and ws_url.startswith("wss://"):
+        # No CA configured — allow self-signed certs
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
         kwargs["ssl"] = ssl_context
 
     return kwargs
@@ -866,6 +872,7 @@ async def auth_status(request: Request):
         "auth_required": True,
         "authenticated": authenticated,
         "username": get_username(),
+        "hostname": os.environ.get("AB_HOST_HOSTNAME", ""),
     }
 
 
@@ -2207,7 +2214,7 @@ async def websocket_proxy(client_ws: WebSocket):
 
 @app.websocket("/ws/pty-state")
 async def pty_state_proxy(client_ws: WebSocket):
-    """Proxy PTY state WebSocket to ab-pty"""
+    """Proxy PTY state WebSocket to ab-pty (DEFAULT, non-agent-specific)"""
     if not await ensure_ws_authenticated(client_ws):
         return
 
