@@ -2000,6 +2000,50 @@ async def agent_paste_image(agent_id: int, request: Request):
         return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
 
 
+# === SSH tunnels (proxy to ab-pty's `tu` wrapper) ===
+
+@app.get("/api/agents/{agent_id}/tunnels")
+async def agent_list_tunnels(agent_id: int):
+    pty_url, _, jwt = get_agent_pty_urls(agent_id)
+    if not pty_url:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    try:
+        async with create_outbound_http_client() as client:
+            resp = await client.get(f"{pty_url}/api/tunnels", headers=get_auth_headers(jwt), timeout=10.0)
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
+
+
+@app.post("/api/agents/{agent_id}/tunnels")
+async def agent_create_tunnel(agent_id: int, request: Request):
+    pty_url, _, jwt = get_agent_pty_urls(agent_id)
+    if not pty_url:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    try:
+        body = await request.json()
+        # Force detached so the daemon doesn't block on `exec ssh`.
+        body["detached"] = True
+        async with create_outbound_http_client() as client:
+            resp = await client.post(f"{pty_url}/api/tunnels", json=body, headers=get_auth_headers(jwt), timeout=15.0)
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
+
+
+@app.delete("/api/agents/{agent_id}/tunnels/{pid}")
+async def agent_kill_tunnel(agent_id: int, pid: str):
+    pty_url, _, jwt = get_agent_pty_urls(agent_id)
+    if not pty_url:
+        return JSONResponse({"error": "Agent not found"}, status_code=404)
+    try:
+        async with create_outbound_http_client() as client:
+            resp = await client.delete(f"{pty_url}/api/tunnels/{quote(pid, safe='*')}", headers=get_auth_headers(jwt), timeout=10.0)
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse({"error": "PTY server unavailable", "details": str(e)}, status_code=503)
+
+
 # === Agent-based WebSocket Proxy ===
 
 @app.websocket("/ws/agents/{agent_id}")
@@ -2378,6 +2422,357 @@ else:
         static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
         app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+
+
+# === Client-cert (mTLS browser auth) ============================================
+#
+# Single-shared-cert model: one self-signed CA + one leaf bundled into a PKCS#12
+# file with no password (the file IS the credential, Incus-style). Issuing a
+# new cert always rotates the CA — i.e. previously downloaded `.p12`s stop
+# working as soon as nginx reloads. That's the revocation mechanism for v1.
+#
+# The CA cert (`ca.crt`) lives next to the back DB so it can be bind-mounted
+# into the edge container as `ssl_client_certificate`. Toggling
+# `settings.client_cert_required` only flips a DB flag; the actual TLS
+# enforcement happens when the edge compose is brought up with the
+# `docker-compose.browser-mtls.yml` overlay (which mounts ca.crt and switches
+# nginx.conf). The UI shows the user the exact compose command to run.
+
+EDGE_TLS_DIR = DB_PATH.parent / "edge-tls"
+EDGE_CA_KEY_PATH = EDGE_TLS_DIR / "ca.key"
+EDGE_CA_CRT_PATH = EDGE_TLS_DIR / "ca.crt"
+EDGE_CLIENT_P12_PATH = EDGE_TLS_DIR / "client.p12"
+EDGE_CLIENT_META_PATH = EDGE_TLS_DIR / "client-meta.json"
+
+
+def _ensure_edge_tls_dir() -> None:
+    EDGE_TLS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(EDGE_TLS_DIR, 0o755)
+    except OSError:
+        pass
+
+
+_NAME_BAD_CHARS = set('"\\,=\x00<>')
+
+
+def _sanitize_cert_name(raw: Optional[str]) -> Optional[str]:
+    """Trim and validate a user-supplied cert name. Returns the cleaned value
+    or None if the user wants the auto-timestamp default. Raises HTTPException
+    on invalid input."""
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if len(s) > 64:
+        raise HTTPException(status_code=400, detail="Cert name too long (max 64 characters).")
+    for ch in s:
+        if ord(ch) < 0x20 or ord(ch) > 0x7E or ch in _NAME_BAD_CHARS:
+            raise HTTPException(status_code=400, detail=f"Cert name contains invalid character: {ch!r}")
+    return s
+
+
+def _safe_filename(name: str) -> str:
+    """Convert a cert name into a filesystem-safe filename component."""
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch in "-_.":
+            out.append(ch)
+        else:
+            out.append("-")
+    return "".join(out) or "ab-client"
+
+
+def _generate_ca_and_leaf(name: Optional[str] = None, password: Optional[str] = None) -> dict:
+    """Generate a fresh self-signed CA and issue a leaf cert into client.p12.
+
+    Always called by /regenerate — full rotation invalidates every previously
+    issued .p12. Returns metadata (fingerprints, timestamps, cert name).
+
+    `name` becomes the leaf's CN AND the basis for the download filename.
+    Empty/None falls back to a UTC-timestamped default like
+    `ab-client-2026-04-29-1145`. `password`, if non-empty, encrypts the .p12
+    with PKCS#12 best-available encryption. Empty/None = no encryption (file
+    is the credential, Incus-style).
+    """
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    _ensure_edge_tls_dir()
+    now = datetime.utcnow()
+    ten_years = timedelta(days=3650)
+    cert_name = name or f"ab-client-{now.strftime('%Y-%m-%d-%H%M%S')}"
+
+    # 1) CA: 4096-bit RSA, self-signed, 10-year validity. cA basicConstraints.
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    ca_subject = x509.Name([
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AB"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "AB Browser CA"),
+    ])
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_subject)
+        .issuer_name(ca_subject)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + ten_years)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=False, key_cert_sign=True, crl_sign=True,
+            content_commitment=False, key_encipherment=False, data_encipherment=False,
+            key_agreement=False, encipher_only=False, decipher_only=False,
+        ), critical=True)
+        .sign(private_key=ca_key, algorithm=hashes.SHA256())
+    )
+
+    # 2) Leaf: 2048-bit RSA, signed by the CA, 5-year validity, CN=<cert_name>.
+    leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf_subject = x509.Name([
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "AB"),
+        x509.NameAttribute(NameOID.COMMON_NAME, cert_name),
+    ])
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(leaf_subject)
+        .issuer_name(ca_subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=1825))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, key_encipherment=True, key_agreement=False,
+            key_cert_sign=False, crl_sign=False, content_commitment=False,
+            data_encipherment=False, encipher_only=False, decipher_only=False,
+        ), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+        .sign(private_key=ca_key, algorithm=hashes.SHA256())
+    )
+
+    # 3) PKCS#12 bundle. If password set, BestAvailableEncryption; else
+    # NoEncryption (file is the credential).
+    encryption = (
+        serialization.BestAvailableEncryption(password.encode())
+        if password
+        else serialization.NoEncryption()
+    )
+    p12 = pkcs12.serialize_key_and_certificates(
+        name=cert_name.encode(),
+        key=leaf_key,
+        cert=leaf_cert,
+        cas=[ca_cert],
+        encryption_algorithm=encryption,
+    )
+
+    # 4) Write to disk atomically.
+    EDGE_CA_KEY_PATH.write_bytes(ca_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    os.chmod(EDGE_CA_KEY_PATH, 0o600)
+    EDGE_CA_CRT_PATH.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    os.chmod(EDGE_CA_CRT_PATH, 0o644)
+    EDGE_CLIENT_P12_PATH.write_bytes(p12)
+    os.chmod(EDGE_CLIENT_P12_PATH, 0o600)
+
+    ca_fp = ca_cert.fingerprint(hashes.SHA256()).hex()
+    leaf_fp = leaf_cert.fingerprint(hashes.SHA256()).hex()
+    # nginx exposes the client cert's SHA1 fingerprint via $ssl_client_fingerprint.
+    # We store it too so the /whoami flow can match what the browser presented.
+    leaf_sha1 = leaf_cert.fingerprint(hashes.SHA1()).hex()
+    meta = {
+        "ca_fingerprint": ca_fp,
+        "leaf_fingerprint": leaf_fp,
+        "leaf_sha1_fingerprint": leaf_sha1,
+        "issued_at": now.isoformat() + "Z",
+        "name": cert_name,
+        "encrypted": bool(password),
+    }
+    EDGE_CLIENT_META_PATH.write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+def _bootstrap_default_cert_if_missing() -> None:
+    """Ensure a CA + leaf exists so nginx can mount ca.crt at startup.
+
+    Called once on back startup. Without this, the edge container would crash
+    trying to mount a non-existent ca.crt for the verifier port (:5444). The
+    user can always regenerate via the UI to rotate.
+    """
+    if EDGE_CA_CRT_PATH.exists() and EDGE_CLIENT_P12_PATH.exists():
+        return
+    try:
+        _generate_ca_and_leaf()
+    except Exception as e:
+        print(f"WARN: bootstrap cert generation failed: {e}")
+
+
+def _read_cert_meta() -> Optional[dict]:
+    if not EDGE_CLIENT_META_PATH.exists():
+        return None
+    try:
+        return json.loads(EDGE_CLIENT_META_PATH.read_text())
+    except Exception:
+        return None
+
+
+@app.get("/api/auth/client-cert/status")
+async def client_cert_status(user: str = Depends(get_current_user)):
+    del user
+    has_cert = EDGE_CLIENT_P12_PATH.exists() and EDGE_CA_CRT_PATH.exists()
+    required_raw = get_setting_value("client_cert_required") or "0"
+    meta = _read_cert_meta() if has_cert else None
+    return {
+        "has_cert": has_cert,
+        "required": required_raw == "1",
+        "ca_fingerprint": meta.get("ca_fingerprint") if meta else None,
+        "leaf_fingerprint": meta.get("leaf_fingerprint") if meta else None,
+        "issued_at": meta.get("issued_at") if meta else None,
+        "name": meta.get("name") if meta else None,
+        "encrypted": bool(meta.get("encrypted")) if meta else False,
+    }
+
+
+class ClientCertRegenerateRequest(BaseModel):
+    name: Optional[str] = None
+    password: Optional[str] = None
+
+
+@app.post("/api/auth/client-cert/regenerate")
+async def client_cert_regenerate(req: Optional[ClientCertRegenerateRequest] = None, user: str = Depends(get_current_user)):
+    del user
+    name = _sanitize_cert_name(req.name if req else None)
+    password = (req.password if req else None) or None
+    if password is not None and password == "":
+        password = None
+    meta = _generate_ca_and_leaf(name=name, password=password)
+    return {"ok": True, **meta}
+
+
+@app.get("/api/auth/client-cert/download")
+async def client_cert_download(user: str = Depends(get_current_user)):
+    del user
+    if not EDGE_CLIENT_P12_PATH.exists():
+        raise HTTPException(status_code=404, detail="No client cert issued yet — generate one first.")
+    data = EDGE_CLIENT_P12_PATH.read_bytes()
+    meta = _read_cert_meta() or {}
+    name = meta.get("name") or "ab-client"
+    filename = f"{_safe_filename(name)}.p12"
+    return Response(
+        content=data,
+        media_type="application/x-pkcs12",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class ClientCertRequireRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/auth/client-cert/require")
+async def client_cert_require(req: ClientCertRequireRequest, user: str = Depends(get_current_user)):
+    del user
+    if req.enabled and not EDGE_CLIENT_P12_PATH.exists():
+        raise HTTPException(status_code=400, detail="Generate a client cert first.")
+    db = SessionLocal()
+    try:
+        upsert_setting(db, "client_cert_required", "1" if req.enabled else "0")
+        db.commit()
+    finally:
+        db.close()
+    return {"ok": True, "required": req.enabled}
+
+
+@app.get("/api/auth/client-cert/whoami")
+async def client_cert_whoami(request: Request, html: int = 0):
+    """Read TLS client-cert info from nginx-injected headers.
+
+    Nginx (mTLS server-block on :5444) forwards $ssl_client_verify,
+    $ssl_client_s_dn, $ssl_client_fingerprint, $ssl_client_serial. We compare
+    the SHA1 fingerprint against the meta we stored at issuance time so the
+    panel can confirm the browser is actually presenting THIS cert (not some
+    unrelated client cert it happens to have).
+
+    `html=1` returns a tiny HTML+JS page that posts the result back to its
+    `window.opener` and self-closes. This lets the panel use a top-level
+    navigation (popup) which reliably triggers Chrome's client-cert chooser,
+    instead of background `fetch` which doesn't.
+
+    Public endpoint (no session cookie) — the response only reveals what the
+    caller themselves just sent. CORS-open so :5443 (different port =
+    different origin) can read it.
+    """
+    verify = request.headers.get("x-ssl-verify", "NONE").upper()
+    fp_raw = (request.headers.get("x-ssl-fingerprint") or "").lower().replace(":", "").strip()
+    subject = request.headers.get("x-ssl-subject") or ""
+    meta = _read_cert_meta() or {}
+    expected = (meta.get("leaf_sha1_fingerprint") or "").lower()
+    matches = bool(expected and fp_raw and fp_raw == expected)
+    body = {
+        "verified": verify.startswith("SUCCESS"),
+        "matches_current_cert": matches,
+        "verify_status": verify,
+        "fingerprint": fp_raw or None,
+        "expected_fingerprint": expected or None,
+        "subject": subject or None,
+    }
+    if html:
+        # Inline JSON in a <script type="application/json"> block so we don't
+        # need to worry about quote-escaping inside a JS literal.
+        json_str = json.dumps(body)
+        page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>AB client-cert verify</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; background:#1a1a1a; color:#ddd; padding:2rem; }}
+  h2 {{ font-size:1rem; color:#d4a574; margin:0 0 .5rem; }}
+  .ok {{ color:#4ade80; }} .bad {{ color:#f87171; }}
+  pre {{ background:#0e0e0e; padding:1rem; border-radius:.5rem; font-size:.8rem; overflow:auto; }}
+  .note {{ color:#888; font-size:.8rem; margin-top:1rem; }}
+</style></head><body>
+<h2>AB client-cert verifier</h2>
+<div id="status"></div>
+<pre id="out">…</pre>
+<div class="note">This page posts the result back to the panel and closes automatically.</div>
+<script id="payload" type="application/json">{json_str}</script>
+<script>
+(function() {{
+  var data = JSON.parse(document.getElementById('payload').textContent);
+  document.getElementById('out').textContent = JSON.stringify(data, null, 2);
+  document.getElementById('status').innerHTML = data.matches_current_cert
+    ? '<span class="ok">✓ Verified — fingerprint matches the issued cert.</span>'
+    : (data.verified
+        ? '<span class="bad">⚠ A cert was presented but it doesn\\'t match the current one.</span>'
+        : '<span class="bad">✗ No cert presented.</span>');
+  try {{
+    if (window.opener && !window.opener.closed) {{
+      window.opener.postMessage({{ type: 'ab-client-cert-verify', data: data }}, '*');
+      setTimeout(function() {{ try {{ window.close(); }} catch (e) {{}} }}, 1500);
+    }}
+  }} catch (e) {{}}
+}})();
+</script>
+</body></html>"""
+        return Response(
+            content=page,
+            media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+    }
+    return JSONResponse(body, headers=headers)
+
+
+# Bootstrap CA on startup so nginx :5444 can mount ca.crt without crashing.
+_bootstrap_default_cert_if_missing()
 
 
 if __name__ == "__main__":
