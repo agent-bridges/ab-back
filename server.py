@@ -2554,13 +2554,23 @@ def _generate_ca_and_leaf(name: Optional[str] = None, password: Optional[str] = 
         .sign(private_key=ca_key, algorithm=hashes.SHA256())
     )
 
-    # 3) PKCS#12 bundle. If password set, BestAvailableEncryption; else
-    # NoEncryption (file is the credential).
-    encryption = (
-        serialization.BestAvailableEncryption(password.encode())
-        if password
-        else serialization.NoEncryption()
-    )
+    # 3) PKCS#12 bundle. iOS only accepts the legacy PBE-SHA1-3DES + SHA1 MAC
+    # combo for PKCS#12; OpenSSL 3 (and pyca/cryptography's
+    # BestAvailableEncryption) default to AES-256-CBC + SHA-256 MAC, which
+    # iOS reports as "wrong password" (it's actually a parser failure).
+    # Build the iOS-compatible algorithm explicitly. Android/macOS/Windows
+    # accept both, so this is safe across the board. Empty password keeps
+    # NoEncryption — same path as before, file IS the credential.
+    if password:
+        encryption = (
+            serialization.PrivateFormat.PKCS12.encryption_builder()
+            .kdf_rounds(50000)
+            .key_cert_algorithm(pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC)
+            .hmac_hash(hashes.SHA1())
+            .build(password.encode())
+        )
+    else:
+        encryption = serialization.NoEncryption()
     p12 = pkcs12.serialize_key_and_certificates(
         name=cert_name.encode(),
         key=leaf_key,
